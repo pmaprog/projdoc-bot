@@ -14,7 +14,7 @@ def process_schedule_step(message):
             # )
 
             reply += 'Семинар № {}\n"{}"\nДата: {}\n\n'.format(
-                k, v['theme'], seminars_dates[k][group].strftime('%d.%m.%Y')
+                k, v.theme, seminars_dates[k][group].strftime('%d.%m.%Y')
             )
 
         bot.send_message(user.uid, reply, reply_markup=menu)

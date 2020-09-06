@@ -16,13 +16,14 @@ from pprint import pprint as pp
 
 # telebot.logger.setLevel(logging.DEBUG)
 
-from projdocbot import (bot, users, get_user, next_sem, seminars_dates,
-                        seminars, GROUPS, stop)
-from projdocbot.mongo import User
+from projdocbot import (bot, users, get_user, next_sem_num, seminars_dates,
+                        seminars, GROUPS, stop, menu)
+from projdocbot.mongo import User, Test
 from projdocbot.steps.event import process_event_step
 from projdocbot.steps.schedule import process_schedule_step
 from projdocbot.steps.login import process_email_step
 from projdocbot.steps.settings import process_settings_step
+from projdocbot.steps.test import process_test_step, start_test
 
 
 def is_logged_in(m):
@@ -34,8 +35,9 @@ def load_cookies():
     for u in User.objects:
         if u.cookies is not None:
             users[u.uid] = SimpleNamespace(
+                email=u.email,
                 session=requests.session(),
-                question=None,
+                question=0,
                 answers=[]
             )
             cookies = requests.utils.cookiejar_from_dict(json.loads(u.cookies))
@@ -51,23 +53,26 @@ def get_session(email='mpodkolzin@edu.hse.ru', password='SuperPassword'):
 
 
 def remind_about_seminar(group):
-    sem_num, sem = next_sem[group]
+    sem_num = next_sem_num[group]
+    sem = seminars[sem_num]
     sem_date = seminars_dates[sem_num][group]
 
     remained = (sem_date.date() - datetime.now().date()).days
     if remained > 7:
         return
 
-    for u in User.objects(uid__in=users.keys(), group=group):
-        if (u.seminars[sem_num].success_date is None
-                and datetime.now() >= u.remind_date):
+    # filter_ = {f'seminars__{group}__success_date__not__exists': True}
+    for u in User.objects(uid__in=users.keys(), group=group,
+                          remind_date__lte=datetime.now()):
+        if u.seminars[sem_num].success_date is None:
+        #         and u.remind_date and datetime.now() >= u.remind_date):
             u.remind_date = datetime.now() + timedelta(minutes=30)
-            u.seminars[next_sem[u.group][0]].notifications_count += 1
+            u.seminars[sem_num].notifications_count += 1
             u.save()
 
             kb = types.ReplyKeyboardMarkup()
             kb.row('Да', 'Напомни мне через...')
-            reply = f'Через {remained} дней ({sem_date.strftime("%d.%m.%Y")}) состоится семинар на тему\n\n"{sem["theme"]}",\n\nхочешь подготовиться и пройти тест?'
+            reply = f'Через {remained} дней ({sem_date.strftime("%d.%m.%Y")}) состоится семинар на тему\n\n"{sem.theme}",\n\nхочешь подготовиться и пройти тест?'
             sent = bot.send_message(u.uid, reply, reply_markup=kb)
             bot.clear_step_handler_by_chat_id(u.uid)
             bot.register_next_step_handler(sent, process_event_step)
@@ -92,11 +97,10 @@ def update_seminars():
         tds = r.find_all('td')
         sem_num = r.th.text
         if sem_num != '' and tds[0].text != '':
-            seminars[sem_num] = {
-                'theme': tds[5].text,
-                'content': tds[6].text,
-                # 'test': tds[7].text
-            }
+            seminars[sem_num] = SimpleNamespace(
+                theme=tds[5].text,
+                content=tds[6].text
+            )
             seminars_dates[sem_num] = {
                 '1': datetime.strptime(tds[0].text, '%d.%m.%y'),
                 '2': datetime.strptime(tds[1].text, '%d.%m.%y'),
@@ -106,12 +110,18 @@ def update_seminars():
             }
 
     # todo: filter
-    # upcoming_seminars = filter()
     for g in GROUPS:
-        next_sem_num = min(seminars_dates.items(), key=lambda x: x[1][g])[0]
-        # if g in next_sem:
-        #     if next_sem_num != next_sem[g][0]:
-        next_sem[g] = (next_sem_num, seminars[next_sem_num])
+        upcoming_seminars = dict(filter(lambda x: x[1][g] >= datetime.now(), seminars_dates.items()))
+        cur_next_sem_num = min(upcoming_seminars.keys())
+        if g in next_sem_num and cur_next_sem_num != next_sem_num[g]:
+            tommorow = datetime.now() + timedelta(days=1)
+            for u in User.objects(group=g):
+                u.remind_date = tommorow.replace(hour=u.chosen_time.hour,
+                                                 minute=u.chosen_time.minute,
+                                                 second=0, microsecond=0)
+                u.save()
+
+        next_sem_num[g] = cur_next_sem_num
 
 
 def timer():
@@ -123,6 +133,9 @@ def timer():
         if tick % 5 == 0:
             for g in GROUPS:
                 remind_about_seminar(g)
+
+            for u in User.objects(start_test_dt__lte=datetime.now()):
+                start_test(u)
         elif tick % (30 * 60) == 0:
             update_seminars()
             tick = 0  # нужно обнулять, а то будет переполнение
@@ -130,27 +143,28 @@ def timer():
 
 @bot.message_handler(commands=['login'])
 def login(message):
-    user = get_user(message)
+    uid = message.from_user.id
 
     if is_logged_in(message):
-        bot.send_message(user.uid, 'Ты уже авторизован!')
+        bot.send_message(uid, 'Ты уже авторизован!')
         return
 
-    bot.send_message(user.uid, 'Введи Email')
+    bot.send_message(uid, 'Введи Email')
     bot.register_next_step_handler(message, process_email_step)
 
 
 @bot.message_handler(commands=['logout'])
 def logout(message):
-    user = get_user(message)
+    uid = message.from_user.id
 
     if is_logged_in(message):
-        del users[user.uid]
+        user = get_user(message)
         user.cookies = None
         user.save()
-        bot.send_message(user.uid, 'Ты разлогинился', reply_markup=types.ReplyKeyboardRemove())
+        del users[uid]
+        bot.send_message(uid, 'Ты разлогинился', reply_markup=types.ReplyKeyboardRemove())
     else:
-        bot.send_message(user.uid, 'Ты не залогинен')
+        bot.send_message(uid, 'Ты не залогинен')
 
 
 @bot.message_handler(func=is_logged_in)
@@ -184,7 +198,7 @@ def logged_in_handler(message):
         bot.register_next_step_handler(message, process_settings_step)
 
     elif msg_text == 'debug: сбросить тест':
-        user.seminars[next_sem[user.group][0]].success_date = None
+        user.seminars[next_sem_num[user.group]].success_date = None
         user.save()
         bot.send_message(user.uid, 'Сбросили')
 
@@ -199,8 +213,7 @@ def logged_in_handler(message):
 
 @bot.message_handler(func=lambda m: not is_logged_in(m))
 def not_logged_in_handler(message):
-    user = get_user(message)
-    bot.send_message(user.uid, 'Напиши /login, чтобы залогиниться')
+    bot.send_message(message.from_user.id, 'Напиши /login, чтобы залогиниться')
 
 
 def main():

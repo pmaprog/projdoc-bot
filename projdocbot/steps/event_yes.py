@@ -1,20 +1,19 @@
-from projdocbot import bot, get_user
+from datetime import datetime
+
+from projdocbot import bot, get_user, seminars, next_sem_num
 
 
 def process_event_yes_step(message):
     user = get_user(message)
     msg_text = message.text.lower()
 
-    if msg_text == 'начать тест':
-        process_test_step(message)
+    remained = int((user.start_test_dt - datetime.now()).seconds / 60)
 
-    elif msg_text == 'отменить':
-        message.text = 'напомни мне через...'
-        process_event_step(message)
-
-    else:
-        bot.send_message(user.uid, 'Используй меню')
-        bot.register_next_step_handler(message, process_event_yes_step)
+    bot.send_message(user.uid,
+                     'Вот ссылка на материал для подготовки:'
+                     f'\n\n{seminars[next_sem_num[user.group]].content}\n\n'
+                     f'Готовься, тест начнется через {remained} минут')
+    bot.register_next_step_handler(message, process_event_yes_step)
 
 
 from projdocbot.steps.test import process_test_step
