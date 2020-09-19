@@ -13,9 +13,7 @@ def process_schedule_step(message):
             #     k, v['theme'], seminars_dates[k][group].strftime('%d.%m.%Y'), v['content']
             # )
 
-            reply += 'Семинар № {}\n"{}"\nДата: {}\n\n'.format(
-                k, v.theme, seminars_dates[k][group].strftime('%d.%m.%Y')
-            )
+            reply += '{}. {}. {}\n'.format(k, v.theme, seminars_dates[k][group].strftime('%d.%m.%Y'))
 
         bot.send_message(user.uid, reply, reply_markup=menu)
     elif msg_text == 'назад':

@@ -1,5 +1,3 @@
-import os
-import pickle
 import time
 import json
 import logging
@@ -8,7 +6,6 @@ from types import SimpleNamespace
 from requests.exceptions import TooManyRedirects
 import threading
 from datetime import datetime, timedelta
-from bs4 import BeautifulSoup
 
 from telebot import types
 
@@ -16,32 +13,36 @@ from pprint import pprint as pp
 
 # telebot.logger.setLevel(logging.DEBUG)
 
-from projdocbot import (bot, users, get_user, next_sem_num, seminars_dates,
-                        seminars, GROUPS, stop, menu)
-from projdocbot.mongo import User, Test
-from projdocbot.steps.event import process_event_step
+import projdocbot
+from projdocbot import (bot, sessions, get_user, next_sem_num, sh, tests,
+                        setup_chat_logger)
+from projdocbot.mongo import User, UserStatistics
+from projdocbot.timer import timer, update_seminars, remind_about_seminar
+
 from projdocbot.steps.schedule import process_schedule_step
 from projdocbot.steps.login import process_email_step
 from projdocbot.steps.settings import process_settings_step
-from projdocbot.steps.test import process_test_step, start_test
 
 
 def is_logged_in(m):
-    user = get_user(m)
-    return user and user.uid in users
+    return m.from_user.id in sessions
 
 
-def load_cookies():
+def load_sessions():
     for u in User.objects:
         if u.cookies is not None:
-            users[u.uid] = SimpleNamespace(
+            sessions[u.uid] = SimpleNamespace(
                 email=u.email,
                 session=requests.session(),
+                test=None,
                 question=0,
-                answers=[]
+                answers=[],
+                correct=0,
+                url=None,
+                logger=setup_chat_logger(u.email, u.email + '.log')
             )
             cookies = requests.utils.cookiejar_from_dict(json.loads(u.cookies))
-            users[u.uid].session.cookies.update(cookies)
+            sessions[u.uid].session.cookies.update(cookies)
 
 
 def get_session(email='mpodkolzin@edu.hse.ru', password='SuperPassword'):
@@ -52,96 +53,28 @@ def get_session(email='mpodkolzin@edu.hse.ru', password='SuperPassword'):
     return session
 
 
-def remind_about_seminar(group):
-    sem_num = next_sem_num[group]
-    sem = seminars[sem_num]
-    sem_date = seminars_dates[sem_num][group]
-
-    remained = (sem_date.date() - datetime.now().date()).days
-    if remained > 7:
-        return
-
-    # filter_ = {f'seminars__{group}__success_date__not__exists': True}
-    for u in User.objects(uid__in=users.keys(), group=group,
-                          remind_date__lte=datetime.now()):
-        if u.seminars[sem_num].success_date is None:
-        #         and u.remind_date and datetime.now() >= u.remind_date):
-            u.remind_date = datetime.now() + timedelta(minutes=30)
-            u.seminars[sem_num].notifications_count += 1
-            u.save()
-
-            kb = types.ReplyKeyboardMarkup()
-            kb.row('Да', 'Напомни мне через...')
-            reply = f'Через {remained} дней ({sem_date.strftime("%d.%m.%Y")}) состоится семинар на тему\n\n"{sem.theme}",\n\nхочешь подготовиться и пройти тест?'
-            sent = bot.send_message(u.uid, reply, reply_markup=kb)
-            bot.clear_step_handler_by_chat_id(u.uid)
-            bot.register_next_step_handler(sent, process_event_step)
+def load_tests():
+    rows = sh.worksheet('Тест').get_all_values()
+    cur_sem = None
+    for cols in rows:
+        if cols[1] == '':
+            cur_sem = cols[0]
+            tests[cur_sem] = SimpleNamespace(questions=[], choices=[])
+        else:
+            cols = [i for i in cols if i != '']
+            tests[cur_sem].questions.append(cols[0])
+            tests[cur_sem].choices.append(cols[1:])
 
 
-def update_seminars():
-    """
-    Заполняет словарь с расписанием семинаров
-    """
-
-    # todo: вынести в отдельную функцию
-    global bot_session
-    try:
-        schedule_response = bot_session.get('https://online.hse.ru/mod/page/view.php?id=123827')
-    except TooManyRedirects:
-        bot_session = get_session()
-        schedule_response = bot_session.get('https://online.hse.ru/mod/page/view.php?id=123827')
-    schedule_soup = BeautifulSoup(schedule_response.text, features='lxml')
-
-    rows = schedule_soup.table.tbody.find_all('tr')
-    for r in rows:
-        tds = r.find_all('td')
-        sem_num = r.th.text
-        if sem_num != '' and tds[0].text != '':
-            seminars[sem_num] = SimpleNamespace(
-                theme=tds[5].text,
-                content=tds[6].text
-            )
-            seminars_dates[sem_num] = {
-                '1': datetime.strptime(tds[0].text, '%d.%m.%y'),
-                '2': datetime.strptime(tds[1].text, '%d.%m.%y'),
-                '3': datetime.strptime(tds[2].text, '%d.%m.%y'),
-                '4': datetime.strptime(tds[3].text, '%d.%m.%y'),
-                '5': datetime.strptime(tds[4].text, '%d.%m.%y')
-            }
-
-    # todo: filter
-    for g in GROUPS:
-        upcoming_seminars = dict(filter(lambda x: x[1][g] >= datetime.now(), seminars_dates.items()))
-        cur_next_sem_num = min(upcoming_seminars.keys())
-        if g in next_sem_num and cur_next_sem_num != next_sem_num[g]:
-            tommorow = datetime.now() + timedelta(days=1)
-            for u in User.objects(group=g):
-                u.remind_date = tommorow.replace(hour=u.chosen_time.hour,
-                                                 minute=u.chosen_time.minute,
-                                                 second=0, microsecond=0)
-                u.save()
-
-        next_sem_num[g] = cur_next_sem_num
+@bot.middleware_handler(update_types=['message'])
+def log_msg(bot_instance, m):
+    uid = m.chat.id
+    if uid in sessions:
+        user = get_user(m)
+        sessions[uid].logger.info(m.text, extra={'sem_num': next_sem_num[user.group]})
 
 
-def timer():
-    tick = 0
-    while not stop:
-        time.sleep(1)
-        tick += 1
-
-        if tick % 5 == 0:
-            for g in GROUPS:
-                remind_about_seminar(g)
-
-            for u in User.objects(start_test_dt__lte=datetime.now()):
-                start_test(u)
-        elif tick % (30 * 60) == 0:
-            update_seminars()
-            tick = 0  # нужно обнулять, а то будет переполнение
-
-
-@bot.message_handler(commands=['login'])
+@bot.message_handler(commands=['start'])
 def login(message):
     uid = message.from_user.id
 
@@ -153,6 +86,7 @@ def login(message):
     bot.register_next_step_handler(message, process_email_step)
 
 
+# todo: deprecated
 @bot.message_handler(commands=['logout'])
 def logout(message):
     uid = message.from_user.id
@@ -161,10 +95,15 @@ def logout(message):
         user = get_user(message)
         user.cookies = None
         user.save()
-        del users[uid]
+        del sessions[uid]
         bot.send_message(uid, 'Ты разлогинился', reply_markup=types.ReplyKeyboardRemove())
     else:
         bot.send_message(uid, 'Ты не залогинен')
+
+
+@bot.message_handler(commands=['exc'])
+def debug_exception(message):
+    raise Exception('debug')
 
 
 @bot.message_handler(func=is_logged_in)
@@ -175,7 +114,7 @@ def logged_in_handler(message):
     if msg_text == 'страница курса':
         bot.send_message(user.uid, 'https://online.hse.ru/course/view.php?id=1845')
 
-    elif msg_text == 'расписание модуля':
+    elif msg_text == 'расписание':
         kb = types.ReplyKeyboardMarkup()
         (kb.row('БИВ171'), kb.row('БИВ172'), kb.row('БИВ173'), kb.row('БИВ174'), kb.row('БИВ175'), kb.row('Назад'))
         bot.send_message(user.uid, 'Выбери группу', reply_markup=kb)
@@ -203,7 +142,7 @@ def logged_in_handler(message):
         bot.send_message(user.uid, 'Сбросили')
 
     elif msg_text == 'debug: отправить уведомление':
-        user.remind_date = datetime.now()
+        user.notify_dt = datetime.now()
         user.save()
         remind_about_seminar(user.group)
 
@@ -213,25 +152,27 @@ def logged_in_handler(message):
 
 @bot.message_handler(func=lambda m: not is_logged_in(m))
 def not_logged_in_handler(message):
-    bot.send_message(message.from_user.id, 'Напиши /login, чтобы залогиниться')
+    bot.send_message(message.from_user.id, 'Напиши /start, чтобы войти в систему и включить напоминания о предстоящих семинарах')
 
 
 def main():
-    global bot_session
-    global stop
+    load_sessions()
+    load_tests()
+    update_seminars()
 
-    try:
-        load_cookies()
+    while True:
         try:
-            bot_session = users[list(users.keys())[0]].session
-        except:
-            bot_session = get_session()
+            projdocbot.stop = False
+            threading.Thread(target=timer).start()
 
-        update_seminars()
-        threading.Thread(target=timer).start()
-
-        print('Start polling...')
-        bot.polling()
-    finally:
-        stop = True
-        print('End polling...')
+            print('Start polling...')
+            bot.load_next_step_handlers()
+            bot.polling(none_stop=True)
+            projdocbot.stop = True
+            break
+        except Exception as e:
+            print(e)
+            projdocbot.stop = True
+            time.sleep(10)
+        finally:
+            print('End polling...')

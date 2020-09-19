@@ -1,4 +1,8 @@
+import uuid
+from datetime import datetime, timedelta
+
 from mongoengine import *
+
 
 connect('projdoc', host='localhost', port=27017)
 
@@ -7,8 +11,7 @@ class UserStatistics(EmbeddedDocument):
     correct_answers_lst = ListField(IntField(), default=list)
     notifications_count = IntField(default=0)
     success_date = DateTimeField(null=True)
-    # отслеживать нажатие на ссылку
-    # отслеживать нажатия кнопок студентами
+    url_clicks = ListField(DateTimeField(), default=list)
 
 
 class User(Document):
@@ -22,11 +25,25 @@ class User(Document):
     group = StringField()
     seminars = MapField(EmbeddedDocumentField(UserStatistics))
 
-    remind_date = DateTimeField()
+    notify_dt = DateTimeField()
     start_test_dt = DateTimeField()
+    stop_test_dt = DateTimeField()
 
     meta = {'collection': 'users'}
 
+    def notify_tommorow(self):
+        tommorow = datetime.now() + timedelta(days=1)
+        self.notify_dt = tommorow.replace(hour=self.chosen_time.hour,
+                                          minute=self.chosen_time.minute,
+                                          second=0, microsecond=0)
+        self.save()
 
-class Test(DynamicDocument):
-    meta = {'collection': 'tests'}
+
+class Url(Document):
+    key = StringField(default=str(uuid.uuid4())[:8])
+    uid = IntField()
+    url = StringField()
+    sem_num = StringField()
+    exp_dt = DateTimeField(default=datetime.now() + timedelta(minutes=30))
+
+    meta = {'collection': 'urls'}
